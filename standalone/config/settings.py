@@ -154,6 +154,14 @@ HELPDESK_VALIDATE_ATTACHMENT_TYPES = (
     os.environ.get("HELPDESK_VALIDATE_ATTACHMENT_TYPES", "True") == "True"
 )
 
+HELPDESK_VALID_EXTENSIONS = [
+    ".png",
+    ".jpg",
+    ".jpeg",
+]
+
+DATA_UPLOAD_MAX_MEMORY_SIZE = 8 * 1024 * 1024
+
 # Should the Knowledgebase be enabled?
 HELPDESK_KB_ENABLED = os.environ.get("HELPDESK_KB_ENABLED", "True") == "True"
 

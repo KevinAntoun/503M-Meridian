@@ -47,7 +47,10 @@ from helpdesk.settings import (
 )
 from helpdesk.signals import new_ticket_done
 from helpdesk.user import HelpdeskUser
-from helpdesk.validators import validate_file_extension
+from helpdesk.validators import (
+    sanitize_attachment,
+    validate_file_extension,
+)
 
 if helpdesk_settings.HELPDESK_KB_ENABLED:
     from helpdesk.models import KBItem
@@ -377,6 +380,31 @@ class AbstractTicketForm(CustomFieldMixin, forms.Form):
             }
 
             self.customfield_to_field(field, instanceargs)
+
+    def clean_attachment(self):
+        uploaded = self.cleaned_data.get("attachment")
+
+        if uploaded is None:
+            return uploaded
+
+        try:
+            clean_file, detected_type = sanitize_attachment(
+                uploaded
+            )
+        except ValidationError as exc:
+            logger.warning(
+                "attachment_rejected owner=unresolved "
+                "size=%s check=%s",
+                uploaded.size,
+                exc.code or "validation",
+            )
+            raise ValidationError(
+                _("Attachment rejected."),
+                code=exc.code or "validation",
+            ) from None
+
+        clean_file.content_type = detected_type
+        return clean_file
 
     def _get_queue(self):
         # this procedure is re-defined for public submission form

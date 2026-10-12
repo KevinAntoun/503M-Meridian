@@ -43,6 +43,18 @@ from .lib import (
 from .templated_email import send_templated_mail
 from .validators import validate_file_extension
 
+import logging
+
+from django.contrib.sites.models import Site
+from django.db import transaction
+from django.db.models import Sum
+from .validators import sanitize_attachment
+
+
+attachment_logger = logging.getLogger(__name__)
+
+ATTACHMENT_QUOTA_BYTES = 100 * 1024 * 1024
+
 User = get_user_model()
 
 
@@ -433,41 +445,114 @@ class Queue(models.Model):
         self.permission_name = f"helpdesk.{basename}"
         return basename
 
+
     def save(self, *args, **kwargs):
-        if self.email_box_type == "imap" and not self.email_box_imap_folder:
-            self.email_box_imap_folder = "INBOX"
+        new_file = bool(
+            self.file and not self.file._committed
+        )
 
-        if self.socks_proxy_type:
-            if not self.socks_proxy_host:
-                self.socks_proxy_host = "127.0.0.1"
-            if not self.socks_proxy_port:
-                self.socks_proxy_port = 9150
-        else:
-            self.socks_proxy_host = None
-            self.socks_proxy_port = None
+        owner_id = (
+            self.followup.user_id
+            if isinstance(self, FollowUpAttachment)
+            else None
+        )
 
-        if not self.email_box_port:
-            if self.email_box_type == "imap" and self.email_box_ssl:
-                self.email_box_port = 993
-            elif self.email_box_type == "imap" and not self.email_box_ssl:
-                self.email_box_port = 143
-            elif self.email_box_type == "pop3" and self.email_box_ssl:
-                self.email_box_port = 995
-            elif self.email_box_type == "pop3" and not self.email_box_ssl:
-                self.email_box_port = 110
+        original_size = (
+            self.file.size if new_file else self.size
+        )
 
-        if not self.id:
-            # Prepare the permission codename and the permission
-            # (even if they are not needed with the current configuration)
-            basename = self.prepare_permission_name()
+        try:
+            if new_file:
+                original_name = self.filename or self.file.name
 
-            Permission.objects.create(
-                name=_("Permission for queue: ") + self.title,
-                content_type=ContentType.objects.get_for_model(self.__class__),
-                codename=basename,
+                # Validate and re-encode before permanent storage.
+                clean_file, detected_type = sanitize_attachment(
+                    self.file
+                )
+
+                self.file = clean_file
+                self.filename = original_name
+                self.mime_type = detected_type
+                self.size = clean_file.size
+
+            if not self.size:
+                self.size = self.get_size()
+
+            if not self.filename:
+                self.filename = self.get_filename()
+
+            if not self.mime_type:
+                self.mime_type = (
+                    mimetypes.guess_type(
+                        self.filename, strict=False
+                    )[0]
+                    or "application/octet-stream"
+                )
+
+            if new_file:
+                with transaction.atomic():
+                    if isinstance(self, FollowUpAttachment):
+                        if owner_id is not None:
+                            # Serialize uploads for this user.
+                            User.objects.select_for_update().get(
+                                pk=owner_id
+                            )
+                        else:
+                            # Public/email uploads share an
+                            # anonymous quota bucket.
+                            Site.objects.select_for_update().get(
+                                pk=settings.SITE_ID
+                            )
+
+                        existing = FollowUpAttachment.objects.filter(
+                            followup__user_id=owner_id
+                        )
+                    else:
+                        # Knowledge-base attachments have no user
+                        # owner in Meridian's existing model.
+                        Site.objects.select_for_update().get(
+                            pk=settings.SITE_ID
+                        )
+                        existing = KBIAttachment.objects.all()
+
+                    if self.pk:
+                        existing = existing.exclude(pk=self.pk)
+
+                    used = (
+                        existing.aggregate(total=Sum("size"))["total"]
+                        or 0
+                    )
+
+                    if used + self.size > ATTACHMENT_QUOTA_BYTES:
+                        raise ValidationError(
+                            "Attachment rejected.",
+                            code="quota_exceeded",
+                        )
+
+                    result = super().save(*args, **kwargs)
+            else:
+                result = super().save(*args, **kwargs)
+
+        except ValidationError as exc:
+            attachment_logger.warning(
+                "attachment_rejected owner=%s size=%s check=%s",
+                owner_id if owner_id is not None else "anonymous",
+                original_size,
+                exc.code or "validation",
+            )
+            raise
+
+        if new_file:
+            attachment_logger.info(
+                "attachment_accepted owner=%s stored=%s "
+                "size=%s type=%s",
+                owner_id if owner_id is not None else "anonymous",
+                self.file.name,
+                self.size,
+                self.mime_type,
             )
 
-        super().save(*args, **kwargs)
+        return result
 
     def delete(self, *args, **kwargs):
         permission_name = self.permission_name
@@ -1212,6 +1297,23 @@ def attachment_path(instance, filename):
     return instance.attachment_path(filename)
 
 
+def generated_attachment_filename(filename):
+    if (
+        not isinstance(filename, str)
+        or filename.count(".") != 1
+        or "/" in filename
+        or "\\" in filename
+    ):
+        raise ValidationError("Invalid attachment filename.")
+
+    extension = os.path.splitext(filename)[1].lower()
+
+    if extension not in {".png", ".jpg", ".jpeg"}:
+        raise ValidationError("Unsupported attachment type.")
+
+    return f"{uuid.uuid4().hex}{extension}"
+
+
 class Attachment(models.Model):
     """
     Represents a file attached to a follow-up. This could come from an e-mail
@@ -1297,7 +1399,10 @@ class FollowUpAttachment(Attachment):
             and not os.path.exists(att_path)
         ):
             os.makedirs(att_path, helpdesk_settings.HELPDESK_ATTACHMENT_DIR_PERMS)
-        return os.path.join(path, filename)
+        return os.path.join(
+            path,
+            generated_attachment_filename(filename),
+        )
 
 
 class KBIAttachment(Attachment):
@@ -1308,14 +1413,19 @@ class KBIAttachment(Attachment):
     )
 
     def attachment_path(self, filename):
-        path = f"helpdesk/attachments/kb/{self.kbitem.category}/{self.kbitem.id}"
+        path = (f"helpdesk/attachments/kb/"
+        f"{self.kbitem.category_id}/{self.kbitem.id}"
+        )
         att_path = os.path.join(settings.MEDIA_ROOT, path)
         if (
             settings.STORAGES == "django.core.files.storage.FileSystemStorage"
             and not os.path.exists(att_path)
         ):
             os.makedirs(att_path, helpdesk_settings.HELPDESK_ATTACHMENT_DIR_PERMS)
-        return os.path.join(path, filename)
+        return os.path.join(
+            path,
+            generated_attachment_filename(filename),
+        )
 
 
 class PreSetReply(models.Model):

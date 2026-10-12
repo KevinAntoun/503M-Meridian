@@ -24,6 +24,7 @@ dependencies = [
     "oauthlib",
     "requests-oauthlib",
     "requests",
+    "pillow>=11.3.0",
 ]
 
 classifiers = [

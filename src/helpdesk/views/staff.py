@@ -1455,18 +1455,56 @@ def debug_info(request):
     )
 
 
+
 @helpdesk_staff_member_required
 def download_attachment(request):
-    """Download an attachment by its stored path under the media directory."""
-    import os
+    """Download a file only from inside MEDIA_ROOT."""
+    from pathlib import Path
 
+    from django.http import FileResponse, Http404
+
+    # Reject requests without a path.
     rel = request.GET.get("path", "")
-    full = os.path.join(settings.MEDIA_ROOT, rel)
-    with open(full, "rb") as handle:
-        data = handle.read()
-    response = HttpResponse(data, content_type="application/octet-stream")
-    response["Content-Disposition"] = f'attachment; filename="{os.path.basename(rel)}"'
-    return response
+
+    if not rel or "\x00" in rel or "\\" in rel:
+        raise Http404("Attachment unavailable")
+
+    try:
+        media_root = Path(settings.MEDIA_ROOT).resolve(strict=True)
+
+        supplied_path = Path(rel)
+
+        # Reject absolute paths and parent traversal.
+        if (
+            supplied_path.is_absolute()
+            or ".." in supplied_path.parts
+        ):
+            raise Http404("Attachment unavailable")
+
+        # Resolve the destination before checking containment.
+        full_path = (media_root / supplied_path).resolve(
+            strict=True
+        )
+
+        # Make sure the resolved file remains inside MEDIA_ROOT.
+        try:
+            full_path.relative_to(media_root)
+        except ValueError:
+            raise Http404("Attachment unavailable")
+
+        if not full_path.is_file():
+            raise Http404("Attachment unavailable")
+
+        # Django manages closing the streamed file.
+        return FileResponse(
+            full_path.open("rb"),
+            as_attachment=True,
+            filename="attachment",
+            content_type="application/octet-stream",
+        )
+
+    except (OSError, RuntimeError, ValueError):
+        raise Http404("Attachment unavailable") from None
 
 
 @helpdesk_staff_member_required

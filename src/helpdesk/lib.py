@@ -149,42 +149,42 @@ def text_is_spam(text, request):
     return False
 
 
+
 def process_attachments(followup, attached_files):
     max_email_attachment_size = getattr(
         settings, "HELPDESK_MAX_EMAIL_ATTACHMENT_SIZE", 512000
     )
     attachments = []
-    errors = set()
+    errors = []
 
     for attached in attached_files:
-        if attached.size:
-            from helpdesk.models import FollowUpAttachment
+        if not attached.size:
+            errors.append(ValidationError("Attachment rejected."))
+            continue
 
-            filename = smart_str(attached.name)
-            att = FollowUpAttachment(
-                followup=followup,
-                file=attached,
-                filename=filename,
-                mime_type=attached.content_type
-                or mimetypes.guess_type(filename, strict=False)[0]
-                or "application/octet-stream",
-                size=attached.size,
-            )
-            try:
-                att.full_clean()
-            except ValidationError as e:
-                errors.add(e)
-            else:
-                att.save()
+        from helpdesk.models import FollowUpAttachment
 
-                if attached.size < max_email_attachment_size:
-                    # Only files smaller than 512kb (or as defined in
-                    # settings.HELPDESK_MAX_EMAIL_ATTACHMENT_SIZE) are sent via
-                    # email.
-                    attachments.append([filename, att.file])
+        filename = smart_str(attached.name)
+
+        att = FollowUpAttachment(
+            followup=followup,
+            file=attached,
+            filename=filename,
+            mime_type="application/octet-stream",
+            size=attached.size,
+        )
+
+        try:
+            att.full_clean()
+            att.save()
+        except ValidationError:
+            errors.append(ValidationError("Attachment rejected."))
+        else:
+            if att.size < max_email_attachment_size:
+                attachments.append([filename, att.file])
 
     if errors:
-        raise ValidationError(list(errors))
+        raise ValidationError(errors)
 
     return attachments
 

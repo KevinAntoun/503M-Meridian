@@ -447,112 +447,38 @@ class Queue(models.Model):
 
 
     def save(self, *args, **kwargs):
-        new_file = bool(
-            self.file and not self.file._committed
-        )
+        if self.email_box_type == "imap" and not self.email_box_imap_folder:
+            self.email_box_imap_folder = "INBOX"
 
-        owner_id = (
-            self.followup.user_id
-            if isinstance(self, FollowUpAttachment)
-            else None
-        )
+        if self.socks_proxy_type:
+            if not self.socks_proxy_host:
+                self.socks_proxy_host = "127.0.0.1"
+            if not self.socks_proxy_port:
+                self.socks_proxy_port = 9150
+        else:
+            self.socks_proxy_host = None
+            self.socks_proxy_port = None
 
-        original_size = (
-            self.file.size if new_file else self.size
-        )
+        if not self.email_box_port:
+            if self.email_box_type == "imap" and self.email_box_ssl:
+                self.email_box_port = 993
+            elif self.email_box_type == "imap" and not self.email_box_ssl:
+                self.email_box_port = 143
+            elif self.email_box_type == "pop3" and self.email_box_ssl:
+                self.email_box_port = 995
+            elif self.email_box_type == "pop3" and not self.email_box_ssl:
+                self.email_box_port = 110
 
-        try:
-            if new_file:
-                original_name = self.filename or self.file.name
+        if not self.id:
+            basename = self.prepare_permission_name()
 
-                # Validate and re-encode before permanent storage.
-                clean_file, detected_type = sanitize_attachment(
-                    self.file
-                )
-
-                self.file = clean_file
-                self.filename = original_name
-                self.mime_type = detected_type
-                self.size = clean_file.size
-
-            if not self.size:
-                self.size = self.get_size()
-
-            if not self.filename:
-                self.filename = self.get_filename()
-
-            if not self.mime_type:
-                self.mime_type = (
-                    mimetypes.guess_type(
-                        self.filename, strict=False
-                    )[0]
-                    or "application/octet-stream"
-                )
-
-            if new_file:
-                with transaction.atomic():
-                    if isinstance(self, FollowUpAttachment):
-                        if owner_id is not None:
-                            # Serialize uploads for this user.
-                            User.objects.select_for_update().get(
-                                pk=owner_id
-                            )
-                        else:
-                            # Public/email uploads share an
-                            # anonymous quota bucket.
-                            Site.objects.select_for_update().get(
-                                pk=settings.SITE_ID
-                            )
-
-                        existing = FollowUpAttachment.objects.filter(
-                            followup__user_id=owner_id
-                        )
-                    else:
-                        # Knowledge-base attachments have no user
-                        # owner in Meridian's existing model.
-                        Site.objects.select_for_update().get(
-                            pk=settings.SITE_ID
-                        )
-                        existing = KBIAttachment.objects.all()
-
-                    if self.pk:
-                        existing = existing.exclude(pk=self.pk)
-
-                    used = (
-                        existing.aggregate(total=Sum("size"))["total"]
-                        or 0
-                    )
-
-                    if used + self.size > ATTACHMENT_QUOTA_BYTES:
-                        raise ValidationError(
-                            "Attachment rejected.",
-                            code="quota_exceeded",
-                        )
-
-                    result = super().save(*args, **kwargs)
-            else:
-                result = super().save(*args, **kwargs)
-
-        except ValidationError as exc:
-            attachment_logger.warning(
-                "attachment_rejected owner=%s size=%s check=%s",
-                owner_id if owner_id is not None else "anonymous",
-                original_size,
-                exc.code or "validation",
-            )
-            raise
-
-        if new_file:
-            attachment_logger.info(
-                "attachment_accepted owner=%s stored=%s "
-                "size=%s type=%s",
-                owner_id if owner_id is not None else "anonymous",
-                self.file.name,
-                self.size,
-                self.mime_type,
+            Permission.objects.create(
+                name=_("Permission for queue: ") + self.title,
+                content_type=ContentType.objects.get_for_model(self.__class__),
+                codename=basename,
             )
 
-        return result
+        super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
         permission_name = self.permission_name
@@ -1347,21 +1273,109 @@ class Attachment(models.Model):
 
     def __str__(self):
         return f"{self.filename}"
-
+    
     def save(self, *args, **kwargs):
-        if not self.size:
-            self.size = self.get_size()
+        new_file = bool(
+            self.file and not self.file._committed
+        )
 
-        if not self.filename:
-            self.filename = self.get_filename()
+        owner_id = (
+            self.followup.user_id
+            if isinstance(self, FollowUpAttachment)
+            else None
+        )
 
-        if not self.mime_type:
-            self.mime_type = (
-                mimetypes.guess_type(self.filename, strict=False)[0]
-                or "application/octet-stream"
+        original_size = (
+            self.file.size if new_file else self.size
+        )
+
+        try:
+            if new_file:
+                original_name = self.filename or self.file.name
+
+                clean_file, detected_type = sanitize_attachment(
+                    self.file
+                )
+
+                self.file = clean_file
+                self.filename = original_name
+                self.mime_type = detected_type
+                self.size = clean_file.size
+
+            if not self.size:
+                self.size = self.get_size()
+
+            if not self.filename:
+                self.filename = self.get_filename()
+
+            if not self.mime_type:
+                self.mime_type = (
+                    mimetypes.guess_type(
+                        self.filename, strict=False
+                    )[0]
+                    or "application/octet-stream"
+                )
+
+            if new_file:
+                with transaction.atomic():
+                    if isinstance(self, FollowUpAttachment):
+                        if owner_id is not None:
+                            User.objects.select_for_update().get(
+                                pk=owner_id
+                            )
+                        else:
+                            Site.objects.select_for_update().get(
+                                pk=settings.SITE_ID
+                            )
+
+                        existing = FollowUpAttachment.objects.filter(
+                            followup__user_id=owner_id
+                        )
+                    else:
+                        Site.objects.select_for_update().get(
+                            pk=settings.SITE_ID
+                        )
+                        existing = KBIAttachment.objects.all()
+
+                    if self.pk:
+                        existing = existing.exclude(pk=self.pk)
+
+                    used = (
+                        existing.aggregate(total=Sum("size"))["total"]
+                        or 0
+                    )
+
+                    if used + self.size > ATTACHMENT_QUOTA_BYTES:
+                        raise ValidationError(
+                            "Attachment rejected.",
+                            code="quota_exceeded",
+                        )
+
+                    result = super().save(*args, **kwargs)
+            else:
+                result = super().save(*args, **kwargs)
+
+        except ValidationError as exc:
+            attachment_logger.warning(
+                "attachment_rejected owner=%s size=%s check=%s",
+                owner_id if owner_id is not None else "anonymous",
+                original_size,
+                getattr(exc, "code", None) or "validation",
+            )
+            raise
+
+        if new_file:
+            attachment_logger.info(
+                "attachment_accepted owner=%s stored=%s "
+                "size=%s type=%s",
+                owner_id if owner_id is not None else "anonymous",
+                os.path.basename(self.file.name),
+                self.size,
+                self.mime_type,
             )
 
-        return super().save(*args, **kwargs)
+        return result
+
 
     def get_filename(self):
         return str(self.file)

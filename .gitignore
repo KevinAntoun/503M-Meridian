@@ -48,3 +48,5 @@ src/helpdesk/static/helpdesk/vendor/*
 .vscode/
 .cursor/
 .devcontainer/
+
+/lab/jwt.local.env

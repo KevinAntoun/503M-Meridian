@@ -207,6 +207,8 @@ SESSION_COOKIE_AGE = 86400  # = 1 day
 
 # Password validation
 # https://docs.djangoproject.com/en/1.11/ref/settings/#auth-password-validators
+# Password reset tokens expire after 15 minutes.
+PASSWORD_RESET_TIMEOUT = 15 * 60
 
 AUTH_PASSWORD_VALIDATORS = [
     {

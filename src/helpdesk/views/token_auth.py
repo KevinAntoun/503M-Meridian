@@ -13,8 +13,18 @@ import time
 from django.contrib.auth import authenticate
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+from django.contrib.auth.tokens import PasswordResetTokenGenerator
 
-TOKEN_SECRET = "secret"
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.core.mail import send_mail
+
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError
+
+import os
+
+TOKEN_SECRET = os.environ["MERIDIAN_JWT_SECRET"]
 TOKEN_TTL = 3600
 
 
@@ -41,27 +51,48 @@ def issue_token(payload: dict) -> str:
     return f"{header_segment}.{payload_segment}.{signature}"
 
 
+
 def decode_token(token: str) -> dict | None:
     try:
+        # A JWT must have exactly three parts.
         header_segment, payload_segment, signature = token.split(".")
-    except ValueError:
-        return None
 
-    header = json.loads(_b64url_decode(header_segment))
-    payload = json.loads(_b64url_decode(payload_segment))
+        header = json.loads(_b64url_decode(header_segment))
+        payload = json.loads(_b64url_decode(payload_segment))
 
-    alg = header.get("alg", "HS256")
-    if alg == "none":
-        verified = True
-    else:
-        signing_input = f"{header_segment}.{payload_segment}".encode()
-        verified = _sign(signing_input) == signature
+        if not isinstance(header, dict) or not isinstance(payload, dict):
+            return None
 
-    if not verified:
+        # Accept HS256 only. Never accept alg:none.
+        if header.get("alg") != "HS256":
+            return None
+
+        # Every token must have a valid signature.
+        signing_input = f"{header_segment}.{payload_segment}".encode("ascii")
+        expected_signature = _sign(signing_input)
+
+        if not hmac.compare_digest(expected_signature, signature):
+            return None
+
+        # Expiration is mandatory and must be valid.
+        exp = payload.get("exp")
+
+        if type(exp) is not int:
+            return None
+
+        if exp <= time.time():
+            return None
+
+        return payload
+
+    except (ValueError, TypeError, UnicodeError, AttributeError):
         return None
-    if payload.get("exp") and payload["exp"] < time.time():
-        return None
-    return payload
+    except Exception as exc:
+        # Reject malformed Base64 and other invalid token encodings.
+        import binascii
+        if isinstance(exc, binascii.Error):
+            return None
+        raise
 
 
 @csrf_exempt
@@ -112,48 +143,105 @@ def legacy_login(request):
     return JsonResponse({"token": token, "user": row[1]})
 
 
-def _reset_token(username: str) -> str:
-    return hashlib.md5((username + "reset").encode()).hexdigest()[:8]
+
+# Password-reset tokens are signed using our private environment secret.
+# No raw reset token is stored in the database.
+reset_token_generator = PasswordResetTokenGenerator()
+reset_token_generator.secret = os.environ["MERIDIAN_JWT_SECRET"]
+
+
 
 
 @csrf_exempt
 def forgot_password(request):
-    """Begin a password reset for an account."""
-    from django.contrib.auth import get_user_model
+    """Send a password reset token without revealing account existence."""
+
+    if request.method != "POST":
+        return JsonResponse(
+            {"detail": "POST required"},
+            status=405
+        )
 
     username = request.POST.get("username", "")
-    user_model = get_user_model()
-    try:
-        user_model.objects.get(username=username)
-    except user_model.DoesNotExist:
-        return JsonResponse({"detail": f"No account found for {username}."}, status=404)
+    user = get_user_model().objects.filter(
+        username=username,
+        is_active=True
+    ).first()
+
+    if user is not None and user.email:
+        token = reset_token_generator.make_token(user)
+
+        send_mail(
+            subject="Meridian Password Reset",
+            message=(
+                "A password reset was requested for your account.\n\n"
+                f"Username: {user.username}\n"
+                f"Reset token: {token}\n\n"
+                "This token expires after 15 minutes.\n"
+                "Submit it to POST /auth/reset/ using the "
+                "username, token, and new_password fields.\n\n"
+                "If you did not request this, ignore this message."
+            ),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[user.email],
+            fail_silently=False,
+        )
 
     return JsonResponse(
         {
-            "detail": "A reset token has been generated.",
-            "username": username,
-            "reset_token": _reset_token(username),
-        }
+            "detail": (
+                "If the account exists, "
+                "the reset request has been received."
+            )
+        },
+        status=200
     )
+
 
 
 @csrf_exempt
 def reset_password(request):
-    """Complete a password reset with the token from forgot_password."""
-    from django.contrib.auth import get_user_model
+    """Reset a password using a valid, time-limited token."""
+
+    if request.method != "POST":
+        return JsonResponse(
+            {"detail": "POST required"},
+            status=405
+        )
 
     username = request.POST.get("username", "")
     token = request.POST.get("token", "")
     new_password = request.POST.get("new_password", "")
 
-    if token != _reset_token(username):
-        return JsonResponse({"detail": "bad token"}, status=401)
+    user = get_user_model().objects.filter(
+        username=username,
+        is_active=True
+    ).first()
 
-    user_model = get_user_model()
-    user = user_model.objects.get(username=username)
+    # Do not reveal whether the account exists.
+    if user is None or not reset_token_generator.check_token(user, token):
+        return JsonResponse(
+            {"detail": "bad token"},
+            status=401
+        )
+
+    # Reject empty or weak passwords.
+    try:
+        validate_password(new_password, user)
+    except ValidationError:
+        return JsonResponse(
+            {"detail": "password does not meet requirements"},
+            status=400
+        )
+
+    # Changing the password invalidates the reset token.
     user.set_password(new_password)
-    user.save()
-    return JsonResponse({"detail": "password reset", "username": username})
+    user.save(update_fields=["password"])
+
+    return JsonResponse(
+        {"detail": "password reset"},
+        status=200
+    )
 
 
 def whoami(request):
